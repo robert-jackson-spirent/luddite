@@ -26,7 +26,7 @@ type certLoader struct {
 	cert         atomic.Pointer[tls.Certificate]
 	certFilePath string
 	keyFilePath  string
-	watcher      *Watcher
+	watcher      Watcher
 	log          *log.Logger
 }
 
@@ -44,7 +44,7 @@ func NewCertificateLoader(config *ServiceConfig, logger *log.Logger) (Certificat
 		if cl.watcher, err = NewWatcher(cl.certFilePath, cl.keyFilePath, logger); err != nil {
 			return nil, err
 		}
-		go cl.watcher.watch(cl.storeCertificate)
+		go cl.watcher.Watch(cl.storeCertificate)
 	}
 	return cl, nil
 }
@@ -70,13 +70,18 @@ func (l *certLoader) Close() error {
 	return nil
 }
 
-type Watcher struct {
+type Watcher interface {
+	Close() error
+	Watch(loadCertCallback func() error)
+}
+
+type watcher struct {
 	*fsnotify.Watcher
 	watchPaths []*watchPath
 	log        *log.Logger
 }
 
-func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (*Watcher, error) {
+func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (Watcher, error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
@@ -94,7 +99,7 @@ func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (*Watcher,
 		}
 		logger.Debugf("key directory '%s' added to watcher", keyFileDir)
 	}
-	watcher := &Watcher{
+	watcher := &watcher{
 		Watcher: w,
 		log:     logger,
 	}
@@ -110,21 +115,14 @@ func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (*Watcher,
 	return watcher, nil
 }
 
-func (w *Watcher) handleEvent(event fsnotify.Event) (bool, error) {
-	updated := false
-	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-		for _, wp := range w.watchPaths {
-			wfModified, err := wp.updateModTime()
-			if err != nil {
-				return false, err
-			}
-			updated = updated || wfModified
-		}
+func (w *watcher) Close() error {
+	if w.Watcher != nil {
+		return w.Watcher.Close()
 	}
-	return updated, nil
+	return nil
 }
 
-func (w *Watcher) watch(loadCertCallback func() error) {
+func (w *watcher) Watch(loadCertCallback func() error) {
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -154,6 +152,29 @@ func (w *Watcher) watch(loadCertCallback func() error) {
 			w.log.WithError(err).Error("certificate watcher error")
 		}
 	}
+}
+
+func (w *watcher) handleEvent(event fsnotify.Event) (bool, error) {
+	updated := false
+	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+		for _, wp := range w.watchPaths {
+			wfModified, err := wp.updateModTime()
+			if err != nil {
+				return false, err
+			}
+			updated = updated || wfModified
+		}
+	}
+	return updated, nil
+}
+
+func setDeDupTimer(timer *time.Timer, callback func()) *time.Timer {
+	if timer == nil {
+		timer = time.AfterFunc(dedupDelay, callback)
+	} else {
+		timer.Reset(dedupDelay)
+	}
+	return timer
 }
 
 type watchPath struct {
@@ -194,13 +215,4 @@ func (wp *watchPath) updateModTime() (bool, error) {
 		return true, nil
 	}
 	return false, nil
-}
-
-func setDeDupTimer(timer *time.Timer, callback func()) *time.Timer {
-	if timer == nil {
-		timer = time.AfterFunc(dedupDelay, callback)
-	} else {
-		timer.Reset(dedupDelay)
-	}
-	return timer
 }
