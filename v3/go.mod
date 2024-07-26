@@ -1,8 +1,6 @@
 module github.com/SpirentOrion/luddite/v3
 
-go 1.21.0
-
-toolchain go1.21.10
+go 1.18
 
 require (
 	github.com/K-Phoen/negotiation v0.0.0-20160529191006-5f2c7e65d11c
