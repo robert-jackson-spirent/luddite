@@ -3,7 +3,9 @@ package luddite
 import (
 	"crypto/tls"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +26,7 @@ type certLoader struct {
 	cert         atomic.Pointer[tls.Certificate]
 	certFilePath string
 	keyFilePath  string
-	watcher      *fsnotify.Watcher
+	watcher      *Watcher
 	log          *log.Logger
 }
 
@@ -34,13 +36,15 @@ func NewCertificateLoader(config *ServiceConfig, logger *log.Logger) (Certificat
 		keyFilePath:  config.Transport.KeyFilePath,
 		log:          logger,
 	}
-	if err := cl.storeCertificate(); err != nil {
+	var err error
+	if err = cl.storeCertificate(); err != nil {
 		return nil, err
 	}
 	if config.Transport.ReloadOnUpdate {
-		if err := cl.watch(); err != nil {
+		if cl.watcher, err = NewWatcher(cl.certFilePath, cl.keyFilePath, logger); err != nil {
 			return nil, err
 		}
+		go cl.watcher.watch(cl.storeCertificate)
 	}
 	return cl, nil
 }
@@ -66,33 +70,61 @@ func (l *certLoader) Close() error {
 	return nil
 }
 
-func (l *certLoader) watch() error {
-	w, err := fsnotify.NewWatcher()
-	if err != nil {
-		return err
-	}
-	l.watcher = w
-
-	certFileDir := path.Dir(l.certFilePath)
-	if err = l.watcher.Add(certFileDir); err != nil {
-		return fmt.Errorf("error adding dir '%s' to watcher: %s", certFileDir, err.Error())
-	}
-	l.log.Debugf("cert directory '%s' added to watcher", certFileDir)
-
-	keyFileDir := path.Dir(l.keyFilePath)
-	if keyFileDir != certFileDir {
-		if err = l.watcher.Add(keyFileDir); err != nil {
-			return fmt.Errorf("error adding dir '%s' to watcher: %s", keyFileDir, err.Error())
-		}
-		l.log.Debugf("key directory '%s' added to watcher", keyFileDir)
-	}
-
-	go l.fsWatch(l.watcher, l.certFilePath, l.keyFilePath)
-
-	return nil
+type Watcher struct {
+	*fsnotify.Watcher
+	watchPaths []*watchPath
+	log        *log.Logger
 }
 
-func (l *certLoader) fsWatch(watcher *fsnotify.Watcher, filenames ...string) {
+func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (*Watcher, error) {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
+	}
+	certFileDir := path.Dir(certFilePath)
+	if err = w.Add(certFileDir); err != nil {
+		return nil, fmt.Errorf("error adding dir '%s' to watcher: %s", certFileDir, err.Error())
+	}
+	logger.Debugf("cert directory '%s' added to watcher", certFileDir)
+
+	keyFileDir := path.Dir(keyFilePath)
+	if keyFileDir != certFileDir {
+		if err = w.Add(keyFileDir); err != nil {
+			return nil, fmt.Errorf("error adding dir '%s' to watcher: %s", keyFileDir, err.Error())
+		}
+		logger.Debugf("key directory '%s' added to watcher", keyFileDir)
+	}
+	watcher := &Watcher{
+		Watcher: w,
+		log:     logger,
+	}
+	var wp *watchPath
+	for _, fp := range []string{certFilePath, keyFilePath} {
+		wp, err = newWatchPath(fp)
+		if err != nil {
+			return nil, err
+		}
+		watcher.watchPaths = append(watcher.watchPaths, wp)
+		logger.Debugf("added path '%s' to watcher", wp.path)
+	}
+	return watcher, nil
+}
+
+func (w *Watcher) handleEvent(event fsnotify.Event) (bool, error) {
+	updated := false
+	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
+		for _, wp := range w.watchPaths {
+			wfModified, err := wp.updateModTime()
+			if err != nil {
+				return false, err
+			}
+			updated = updated || wfModified
+		}
+	}
+	return updated, nil
+}
+
+func (w *Watcher) watch(loadCertCallback func() error) {
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -101,37 +133,67 @@ func (l *certLoader) fsWatch(watcher *fsnotify.Watcher, filenames ...string) {
 	}()
 	for {
 		select {
-		case event, ok := <-watcher.Events:
+		case event, ok := <-w.Events:
 			if !ok {
 				return
 			}
-			if updated := l.handleFsEvent(event, filenames...); updated {
+			if updated, err := w.handleEvent(event); err != nil {
+				w.log.WithError(err).Error("error handling fs event")
+			} else if updated {
 				// N.B. process the event after a delay to avoid duplicates when both files are written
 				timer = setDeDupTimer(timer, func() {
-					if err := l.storeCertificate(); err != nil {
-						l.log.WithError(err).Error("error reloading certificate")
+					if err = loadCertCallback(); err != nil {
+						w.log.WithError(err).Error("error reloading certificate")
 					}
 				})
 			}
-		case err, ok := <-watcher.Errors:
+		case err, ok := <-w.Errors:
 			if !ok {
 				return
 			}
-			l.log.WithError(err).Error("certificate watcher error")
+			w.log.WithError(err).Error("certificate watcher error")
 		}
 	}
 }
 
-func (l *certLoader) handleFsEvent(event fsnotify.Event, files ...string) bool {
-	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
-		for _, fn := range files {
-			if path.Base(event.Name) == path.Base(fn) {
-				l.log.Debugf("file '%s' was updated", fn)
-				return true
-			}
-		}
+type watchPath struct {
+	path    string
+	modTime atomic.Pointer[time.Time]
+}
+
+func newWatchPath(p string) (*watchPath, error) {
+	wp := &watchPath{path: p}
+	_, err := wp.updateModTime()
+	if err != nil {
+		return nil, err
 	}
-	return false
+	return wp, nil
+}
+
+func (wp *watchPath) latestModTime() (time.Time, error) {
+	f, err := filepath.EvalSymlinks(wp.path)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to eval file path '%s': '%s'", wp.path, err)
+	}
+	fi, err := os.Stat(f)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to get file info '%s': '%s'", f, err)
+	}
+	return fi.ModTime().UTC(), nil
+}
+
+// updateModTime: when the file ModTime is different from previous, stores the updated value and returns true
+func (wp *watchPath) updateModTime() (bool, error) {
+	latestModTime, err := wp.latestModTime()
+	if err != nil {
+		return false, err
+	}
+	previousModTime := wp.modTime.Load()
+	if previousModTime == nil || !previousModTime.Equal(latestModTime) {
+		wp.modTime.Store(&latestModTime)
+		return true, nil
+	}
+	return false, nil
 }
 
 func setDeDupTimer(timer *time.Timer, callback func()) *time.Timer {
