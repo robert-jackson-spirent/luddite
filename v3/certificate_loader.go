@@ -77,7 +77,7 @@ type Watcher interface {
 
 type watcher struct {
 	*fsnotify.Watcher
-	watchPaths []*watchPath
+	watchPaths []WatchPath
 	log        *log.Logger
 }
 
@@ -103,14 +103,14 @@ func NewWatcher(certFilePath, keyFilePath string, logger *log.Logger) (Watcher, 
 		Watcher: w,
 		log:     logger,
 	}
-	var wp *watchPath
+	var wp WatchPath
 	for _, fp := range []string{certFilePath, keyFilePath} {
-		wp, err = newWatchPath(fp)
+		wp, err = NewWatchPath(fp, logger)
 		if err != nil {
 			return nil, err
 		}
 		watcher.watchPaths = append(watcher.watchPaths, wp)
-		logger.Debugf("added path '%s' to watcher", wp.path)
+		logger.Debugf("added path '%s' to watcher", fp)
 	}
 	return watcher, nil
 }
@@ -142,6 +142,12 @@ func (w *watcher) Watch(loadCertCallback func() error) {
 				timer = setDeDupTimer(timer, func() {
 					if err = loadCertCallback(); err != nil {
 						w.log.WithError(err).Error("error reloading certificate")
+						return
+					}
+					for _, wp := range w.watchPaths {
+						if err = wp.StoreModTime(); err != nil {
+							w.log.WithError(err).Errorf("error updating watch path: %s", wp)
+						}
 					}
 				})
 			}
@@ -158,11 +164,7 @@ func (w *watcher) handleEvent(event fsnotify.Event) (bool, error) {
 	updated := false
 	if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 		for _, wp := range w.watchPaths {
-			wfModified, err := wp.updateModTime()
-			if err != nil {
-				return false, err
-			}
-			updated = updated || wfModified
+			updated = updated || wp.IsUpdated()
 		}
 	}
 	return updated, nil
@@ -177,18 +179,45 @@ func setDeDupTimer(timer *time.Timer, callback func()) *time.Timer {
 	return timer
 }
 
+type WatchPath interface {
+	IsUpdated() bool
+	StoreModTime() error
+}
+
 type watchPath struct {
 	path    string
 	modTime atomic.Pointer[time.Time]
+	log     *log.Logger
 }
 
-func newWatchPath(p string) (*watchPath, error) {
-	wp := &watchPath{path: p}
-	_, err := wp.updateModTime()
-	if err != nil {
+func NewWatchPath(p string, logger *log.Logger) (WatchPath, error) {
+	wp := &watchPath{
+		path: p,
+		log:  logger,
+	}
+	if err := wp.StoreModTime(); err != nil {
 		return nil, err
 	}
 	return wp, nil
+}
+
+func (wp *watchPath) IsUpdated() bool {
+	wpLatestModTime, err := wp.latestModTime()
+	if err != nil {
+		wp.log.WithError(err).Errorf("failed to get latest modification time: '%s'", wp.path)
+		return false
+	}
+	wpPreviousModTime := wp.modTime.Load()
+	return wpPreviousModTime == nil || !wpLatestModTime.Equal(*wpPreviousModTime)
+}
+
+func (wp *watchPath) StoreModTime() error {
+	latestModTime, err := wp.latestModTime()
+	if err != nil {
+		return err
+	}
+	wp.modTime.Store(&latestModTime)
+	return nil
 }
 
 func (wp *watchPath) latestModTime() (time.Time, error) {
@@ -201,18 +230,4 @@ func (wp *watchPath) latestModTime() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("failed to get file info '%s': '%s'", f, err)
 	}
 	return fi.ModTime().UTC(), nil
-}
-
-// updateModTime: when the file ModTime is different from previous, stores the updated value and returns true
-func (wp *watchPath) updateModTime() (bool, error) {
-	latestModTime, err := wp.latestModTime()
-	if err != nil {
-		return false, err
-	}
-	previousModTime := wp.modTime.Load()
-	if previousModTime == nil || !previousModTime.Equal(latestModTime) {
-		wp.modTime.Store(&latestModTime)
-		return true, nil
-	}
-	return false, nil
 }
